@@ -1,6 +1,10 @@
 apiVersion: v2
-name: lab-service
-description: Helm chart for experimenting with new services in a lab environment
+name: pvc-rancher
+description: Helm chart wrapping Rancher Local Path Provisioner hardened for Talos Linux and restricted Pod Security Standards
 type: application
 version: 0.2.1
-appVersion: "0.2.1"
+appVersion: "v0.0.37"
+dependencies:
+  - name: local-path-provisioner
+    version: "0.0.37"
+    repository: "oci://ghcr.io/rancher/local-path-provisioner/charts"

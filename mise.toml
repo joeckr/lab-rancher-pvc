@@ -17,18 +17,6 @@ run = """
 hk install --mise
 """
 
-[tasks.compose]
-description = "Run Podman Compose for local lab"
-run = """
-podman compose up -d
-"""
-
-[tasks.down]
-description = "Stop Podman Compose"
-run = """
-podman compose down
-"""
-
 [tasks.play]
 description = "Run Podman Play for local helm chart testing"
 depends = ["helm-t"]

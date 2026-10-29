@@ -1,31 +1,137 @@
-# skeleton-lab-service
+# lab-rancher-pvc
 
-A starter skeleton repository tailored for rapid experimentation, prototyping, and testing of services in a lab environment (local container runtimes and Kubernetes).
-
-> **Note**: This repository intentionally **does NOT include a Dockerfile**. If a custom image build is required, use an OCI image repository (such as `skeleton-oci-modified`). Lab repositories focus on configuring, deploying, and testing upstream or pre-built container services.
+A wrapper Helm chart around Rancher's official [Local Path Provisioner](https://github.com/rancher/local-path-provisioner) chart (`oci://ghcr.io/rancher/local-path-provisioner/charts`), tailored and hardened for **Talos Linux** clusters enforcing Kubernetes **Pod Security Standards (PSS)** `restricted` profiles.
 
 ---
 
-## Features
+## Overview
 
-- **Helm Chart (`chart/`)**:
-  - Out-of-the-box support for deploying services to Kubernetes.
-  - Parameterized upstream container image (`image:tag`), replica count, and ports.
-  - Standard Kubernetes Ingress support (`networking.k8s.io/v1`).
-  - Secure defaults: non-root execution (`runAsNonRoot: true`), `RuntimeDefault` seccomp profile, and dropping `ALL` capabilities.
-  - Master and control-plane node tolerations for compact lab clusters.
-- **Compose (`compose.yml`)**:
-  - Spin up and test the lab service locally in seconds without requiring a cluster.
-  - Pre-configured with port forwarding, and healthchecks.
-- **Environment & Tooling (`mise` & `hk`)**:
-  - `mise.toml`: Tool version management (`helm`, `betterleaks`, `addlicense`, `trivy`, `actionlint`, `shellcheck`, `zizmor`, `hk`, `pkl`, `tombi`, `yamllint`) and convenient task aliases.
-  - `hk.pkl`: Fast git hooks and project checks enforcing Conventional Commits, branch protection, secret scanning (`betterleaks`), Helm linting, workflow linting (`actionlint`), security audits (`zizmor`), YAML linting (`yamllint`), TOML linting (`tombi`), shell checking (`shellcheck`), and license checks (`addlicense`).
-- **GitHub Actions CI (`.github/workflows/`)**:
-  - Reusable workflows powered by [`joeckr/ci-templates`](https://github.com/joeckr/ci-templates):
-    - `lint.yml`: Lints GitHub Actions workflow syntax (`actionlint`), Conventional Commits (`commitlint`), and shell scripts (`shellcheck`).
-    - `security.yml`: Scans commits and PRs for secret leaks (`betterleaks`) and workflow security audits (`zizmor`).
-    - `release.yml`: Automated Semantic Versioning, git tagging, release notes, `Chart.yaml` version syncing (`semantic`), and packaging/publishing Helm charts to GitHub Container Registry (GHCR) as OCI artifacts.
-    - `test_release.yml`: PR dry-run preview for Semantic Versioning and Helm chart packaging.
+Rancher's Local Path Provisioner provides dynamic Persistent Volume (PV) provisioning utilizing local storage on Kubernetes nodes. Standard deployments encounter two critical hurdles on Talos Linux clusters enforcing `restricted` pod security:
+
+1. **Immutable Filesystem Layout**: Talos Linux enforces an immutable, read-only root filesystem (`/`) where the upstream default directory (`/opt/local-path-provisioner`) is ephemeral or unwritable. Talos requires persistent local storage under `/var` (configured to `/var/local/local-path-provisioner` by default).
+2. **Pod Security Standards (`restricted`)**: When `restricted` (or `baseline`) Pod Security Admission (PSA) is enforced cluster-wide, Kubernetes rejects the transient **helper pods** spawned by `local-path-provisioner` because they mount node storage via `hostPath` and execute `mkdir`/`rm -rf` as root (`UID 0`).
+
+Rather than maintaining a forked copy of upstream templates, this chart declares the official upstream `local-path-provisioner` OCI chart as a Helm dependency and extends it with:
+- Automated creation and labeling of the isolated `local-path-storage` namespace with `pod-security.kubernetes.io/enforce: privileged` (`templates/namespace.yaml`).
+- Pre-configured Talos node storage path defaults (`/var/local/local-path-provisioner`).
+- Hardened controller `podSecurityContext` and container `securityContext` defaults that strictly satisfy the PSS `restricted` profile (`UID/GID 65534`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`, `seccompProfile: RuntimeDefault`).
+
+---
+
+## Architecture & Security Model
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ Namespace: local-path-storage (PSA: privileged)                              │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │ Controller Deployment (Upstream subchart, enforces PSS "restricted")   │  │
+│  │  • runAsNonRoot: true (UID/GID 65534)                                  │  │
+│  │  • readOnlyRootFilesystem: true                                        │  │
+│  │  • allowPrivilegeEscalation: false                                     │  │
+│  │  • capabilities.drop: ["ALL"]                                          │  │
+│  │  • seccompProfile: RuntimeDefault                                      │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+│                                      │                                        │
+│                        Watches PVCs  │  Spawns transient                      │
+│                        & Node status │  helper pods                           │
+│                                      ▼                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │ Ephemeral Helper Pods (mkdir -m 0777 / rm -rf)                         │  │
+│  │  • HostPath Volume: /var/local/local-path-provisioner                  │  │
+│  │  • Runs as root briefly to create/remove node volume directories       │  │
+│  │  • priorityClassName: system-node-critical                             │  │
+│  │  • Scoped CPU/memory requests & limits                                 │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+│                                      │                                        │
+└──────────────────────────────────────┼───────────────────────────────────────┘
+                                       ▼ HostPath mount
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ Talos Linux Node (Persistent storage at /var/local/local-path-provisioner)   │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why the Namespace Requires the Privileged PSA Label
+
+Kubernetes Pod Security Admission evaluates pod specifications against standard profiles before admitting them to the API:
+
+- **Restricted & Baseline Profiles**: Strictly prohibit `hostPath` volumes (and `restricted` also prohibits root execution).
+- **Helper Pod Requirement**: When a PVC is bound or deleted, `local-path-provisioner` launches a short-lived pod that mounts the node base path via `hostPath` to run `mkdir -m 0777 -p "$VOL_DIR"` or `rm -rf "$VOL_DIR"`. Creating `$VOL_DIR` with `0777` permissions ensures that non-root application pods running in `restricted` workload namespaces can write to their mounted PVCs without permission errors.
+- **Solution**: The `local-path-storage` namespace is labeled with `pod-security.kubernetes.io/enforce: privileged`. This isolates elevated storage lifecycle operations to `local-path-storage` while keeping `restricted` enforcement intact across all workload namespaces.
+
+### Controller Pod Hardening (Restricted PSS)
+
+Even though `local-path-storage` permits privileged helper pods, the long-running controller `Deployment` is configured via upstream subchart values to comply with the `restricted` standard:
+
+| Security Dimension | Restricted Standard Requirement | Controller Configuration |
+|---|---|---|
+| **Non-Root Execution** | `runAsNonRoot: true` | `runAsNonRoot: true`, `runAsUser: 65534`, `runAsGroup: 65534` |
+| **Root Filesystem** | Immutable best practice | `readOnlyRootFilesystem: true` |
+| **Privilege Escalation** | `allowPrivilegeEscalation: false` | `allowPrivilegeEscalation: false` |
+| **Linux Capabilities** | Drop `ALL` | `capabilities.drop: ["ALL"]` |
+| **Seccomp Profile** | `RuntimeDefault` or `Localhost` | `seccompProfile: { type: RuntimeDefault }` |
+| **Host Namespaces** | Disallow host network/PID/IPC | Private pod namespaces (`hostUsers: true`) |
+
+---
+
+## Talos Linux Node Storage
+
+### Default: Persistent `/var` Partition (`/var/local/local-path-provisioner`)
+
+On Talos Linux, `/var` is backed by the persistent `EPHEMERAL` partition and exposed to the `kubelet`. By setting `local-path-provisioner.nodePathMap` to `/var/local/local-path-provisioner` (the default in this chart), dynamic PV provisioning works out of the box without requiring additional disks or machine configuration patches.
+
+If your Talos setup requires explicit `kubelet` bind-mount propagation for `/var/local/local-path-provisioner`, patch `machine.kubelet.extraMounts`:
+
+```yaml
+machine:
+  kubelet:
+    extraMounts:
+      - destination: /var/local/local-path-provisioner
+        type: bind
+        source: /var/local/local-path-provisioner
+        options:
+          - bind
+          - rshared
+          - rw
+```
+
+### Optional: Dedicated Disk via Talos `UserVolumeConfig`
+
+If you prefer to back local PVs with a dedicated secondary disk using a Talos `UserVolumeConfig` (which mounts under `/var/mnt/<name>`):
+
+1. Apply a `UserVolumeConfig` and expose the mount to `kubelet`:
+
+   ```yaml
+   machine:
+     kubelet:
+       extraMounts:
+         - destination: /var/mnt/local-path-provisioner
+           type: bind
+           source: /var/mnt/local-path-provisioner
+           options:
+             - bind
+             - rshared
+             - rw
+   ---
+   apiVersion: v1alpha1
+   kind: UserVolumeConfig
+   name: local-path-provisioner
+   provisioning:
+     diskSelector:
+       match: "!system_disk"
+     minSize: 100GB
+     maxSize: 100GB
+   ```
+
+2. Override `nodePathMap` when installing the chart:
+
+   ```yaml
+   local-path-provisioner:
+     nodePathMap:
+       - node: DEFAULT_PATH_FOR_NON_LISTED_NODES
+         paths:
+           - /var/mnt/local-path-provisioner
+   ```
 
 ---
 
@@ -40,16 +146,13 @@ A starter skeleton repository tailored for rapid experimentation, prototyping, a
 │       ├── release.yml          # Semantic release and Helm chart publishing to GHCR
 │       └── test_release.yml     # PR dry-run test for releases and chart packaging
 ├── chart/
-│   ├── Chart.yaml               # Helm chart definition
-│   ├── values.yaml              # Default configuration values
+│   ├── Chart.yaml               # Wrapper chart definition & upstream OCI dependency
+│   ├── Chart.lock               # Locked upstream local-path-provisioner chart digest
+│   ├── values.yaml              # Namespace PSA settings & upstream subchart overrides
 │   ├── .helmignore              # Ignore rules for chart packaging
 │   └── templates/
-│       ├── deployment.yaml      # Workload deployment
-│       ├── service.yaml         # Kubernetes Service
-│       └── ingress.yaml         # Kubernetes Ingress
-├── scripts/
-│   └── template.sh              # Helper script placeholder
-├── compose.yml                  # Local lab service definition
+│       ├── _helpers.tpl         # Wrapper chart naming and label helpers
+│       └── namespace.yaml       # Namespace manifest with privileged PSA labels
 ├── hk.pkl                       # hk git hooks and checks configuration
 ├── mise.toml                    # Mise tools and tasks
 └── README.md
@@ -57,250 +160,177 @@ A starter skeleton repository tailored for rapid experimentation, prototyping, a
 
 ---
 
-## Security & Hardened Image Architecture
+## Quickstart & Deployment
 
-Modern hardened Kubernetes environments prioritize workload security and least privilege by enforcing strict runtime constraints. This repository is architected to produce rootless, hardened container images that run out-of-the-box under restricted security standards without requiring root privileges.
+### 1. Tooling Setup
 
-### Hardened Container Standards (Kubernetes PSS `restricted`)
-
-Under the Kubernetes **Pod Security Admission (PSA)** `restricted` profile and modern hardened container runtimes:
-- **Must Run As Non-Root**: The pod specification sets `securityContext.runAsNonRoot: true` with a dedicated non-root UID (`USER 1031` or dynamic non-root UID). Containers cannot execute as UID 0.
-- **Arbitrary Dynamic UIDs**: Workload environments may assign dynamic arbitrary non-root UIDs. Files and directories required at runtime are configured with group 0 permissions (`chgrp -R 0` and `chmod -R g+rwX`) so any non-root UID can execute and access required assets.
-- **Drop All Capabilities**: The container specification explicitly drops all Linux capabilities (`capabilities.drop: ["ALL"]`).
-- **Disallow Privilege Escalation**: Pods enforce `securityContext.allowPrivilegeEscalation: false` to prevent child processes from acquiring additional privileges.
-- **RuntimeDefault Seccomp**: Workloads enforce `seccompProfile: { type: RuntimeDefault }` to restrict syscalls to safe defaults.
-- **Credential Protection**: Hardened with `automountServiceAccountToken: false` to avoid leaking Kubernetes API tokens to application containers unless explicitly needed.
-- **Unprivileged Ports**: Containers listen on non-privileged ports (> 1024).
-- **Standard Ingress & Storage**: Uses standard Kubernetes `networking.k8s.io/v1` `Ingress` and standard CSI PersistentVolumeClaims.
-
-### Compliance Matrix
-
-| Security Dimension | Restricted Standard Requirement | Implementation in This Repo |
-|---|---|---|
-| **Workload Execution** | Non-root UID (`runAsNonRoot: true`) | Unprivileged container image (`nginx-unprivileged`) + `runAsNonRoot: true` |
-| **Group Permissions** | GID 0 (`root` group) with `g+rwX` | Configured for arbitrary UIDs and group 0 compatibility |
-| **Capabilities** | Must drop `ALL` capabilities | `capabilities.drop: ["ALL"]` in Helm chart |
-| **Privilege Escalation** | Prohibited (`allowPrivilegeEscalation: false`) | Configured in Helm `securityContext` |
-| **Seccomp Profile** | `RuntimeDefault` or `Localhost` | `seccompProfile: { type: RuntimeDefault }` |
-| **Service Account Token** | Disabled unless required | `automountServiceAccountToken: false` in pod spec |
-| **Port Binding** | Unprivileged (> 1024) | Listens on port `8080` |
-| **Ingress Layer** | Standard Kubernetes Ingress | Kubernetes Ingress (`networking.k8s.io/v1`) |
----
-
-## Local Environment & Podman Setup
-
-To ensure containerized applications and Helm charts tested locally run cleanly when deployed to hardened Kubernetes environments, this repository is designed to be used alongside the Podman configuration in [joeckr/dotfiles](https://github.com/joeckr/dotfiles).
-
-The dotfiles repository provides a centralized [`containers.conf`](https://github.com/joeckr/dotfiles/blob/main/containers/containers.conf) (deployed to `~/.config/containers/containers.conf`) that configures Podman to enforce rootless and hardened container runtime restrictions in testing:
-
-| Security Rule | Podman Configuration | Description |
-|---|---|---|
-| **Random UID (`MustRunAsRange`)** | `userns = "auto"` | Allocates dynamic subordinate UID/GID ranges from `/etc/subuid` and `/etc/subgid`. Containers run unprivileged without mapping host root. |
-| **Drop Capabilities** | `default_capabilities = ["NET_BIND_SERVICE"]` | Drops standard root capabilities (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID`, `SETGID`, `SYS_CHROOT`, etc.) and permits only `NET_BIND_SERVICE`. |
-| **Disallow Privileged** | `privileged = false` | Disallows privileged container execution by default. |
-| **Seccomp Profile** | `seccomp_profile = "/usr/share/containers/seccomp.json"` | Enforces the runtime default seccomp profile (`RuntimeDefault`). |
-| **Namespace Isolation** | `cgroupns`, `ipcns`, `pidns`, `utsns = "private"` | Enforces private container namespaces (host namespaces are forbidden in restricted profiles). |
-
-### macOS Podman Machine Integration
-
-On macOS, the dotfiles installer script (`brew/podman.sh`) automates the machine lifecycle:
-
-1. Deploys `containers/containers.conf` to `~/.config/containers/containers.conf` on the host.
-2. Initializing `podman machine init` automatically mounts `~/.config/containers` into `/etc/containers` inside the Fedora CoreOS VM.
-3. Automatically symlinks `/etc/containers/containers.conf` to the VM user's config (`~core/.config/containers/containers.conf`) and restarts the Podman API service so all container executions immediately enforce these constraints.
-
----
-
-## Testing & Validation Process
-
-This repository defines a 3-tier testing process to validate container security, manifest generation, and runtime compatibility from local development through to production cluster deployment.
-
-```
-┌─────────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
-│ Tier 1: Local Container │ ──> │ Tier 2: Podman Play     │ ──> │ Tier 3: K8s Cluster     │
-│ Fast local prototyping  │     │ Validate K8s manifests  │     │ Live Helm verification  │
-│ (compose.yml)           │     │ (podman play kube)      │     │ (helm install)          │
-└─────────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
-```
-
-### Tier 1: Local Container Validation (`compose.yml`)
-
-The [`compose.yml`](compose.yml) configuration runs the service container locally using Podman Compose:
+Install the required CLI tools and git hooks:
 
 ```sh
-# Start container in detached mode
-mise run compose
-# or: podman compose up -d
-
-# View container logs
-mise run logs
-# or: podman compose logs -f
-
-# Verify connectivity
-curl http://localhost:8080
-
-# Stop container
-mise run down
-# or: podman compose down
-```
-
-**What this verifies:**
-- Unprivileged user execution without host root privileges.
-- Unprivileged port binding on port `8080`.
-- Health check verification and local volume mount handling.
-
----
-
-### Tier 2: Local Kubernetes Manifest Testing (`mise run play`)
-
-Before deploying to an actual Kubernetes cluster, you can test the rendered Kubernetes manifests locally using Podman's built-in `play kube` feature.
-
-```sh
-# Render templates and play Kubernetes manifests locally
-mise run play
-
-# Teardown the played pod and resources
-mise run play-d
-```
-
-**How `mise run play` works:**
-1. Triggers the dependent task `mise run helm-t`, which executes:
-   ```sh
-   helm dependency build chart/
-   helm template test chart/ > rendered.yaml
-   ```
-2. Executes `podman play kube rendered.yaml --publish-all`, which:
-   - Reads the multi-document Kubernetes YAML (`Deployment`, `Service`).
-   - Creates a local Podman pod matching the Kubernetes `Deployment` specification.
-   - Applies the pod's `securityContext` (`runAsNonRoot: true`, capabilities drop, seccomp profile).
-   - Exposes container port `8080`.
-
-**Inspecting the local play deployment:**
-```sh
-# View running pods created by play kube
-podman pod ps
-
-# View container status within the pod
-podman ps --filter "pod=lab-service"
-
-# Verify service response
-curl http://localhost:8080
-
-# Check container logs within the pod
-podman logs -f lab-service-pod-lab-service
-```
-
-**Teardown:**
-```sh
-mise run play-d
-# or: podman play kube rendered.yaml --down
-```
-
----
-
-### Tier 3: Cluster Deployment & Testing on Kubernetes (`mise run helm-i`)
-
-The final phase validates the workload on a live Kubernetes cluster. This tests real-world Pod Security Admission (PSA) enforcement, network routing, and container startup under production constraints.
-
-#### 1. Cluster Prerequisites & Configuration
-
-Ensure your `kubectl` context points to your Kubernetes cluster:
-```sh
-kubectl config current-context
-```
-
-Verify that the target namespace enforces the `restricted` Pod Security Standard:
-```sh
-kubectl get ns default --show-labels
-# Should include:
-# pod-security.kubernetes.io/enforce=restricted
-# pod-security.kubernetes.io/enforce-version=latest
-```
-
-#### 2. Linting & Template Validation
-
-Run the linter and inspect the generated manifests before cluster deployment:
-```sh
-mise run helm-l
-mise run helm-t
-
-```
-
-#### 3. Deploying to the Cluster
-
-Install the Helm chart release:
-```sh
-mise run helm-i
-# or: helm install test chart/
-```
-
-#### 4. Verifying PSS Compliance & Health
-
-Check the pod status and verify that Kubernetes Pod Security Admission (PSA) allowed the pod to run:
-
-```sh
-# Check pod deployment status
-kubectl get pods -l app=lab-service
-
-# Inspect pod details and events for security policy rejections
-kubectl describe pod -l app=lab-service
-```
-
-> [!TIP]
-> If your namespace enforces the `restricted` Pod Security Standard and there are non-compliant settings (such as missing `runAsNonRoot` or un-dropped capabilities), `kubectl describe pod` will show warning events from the `pod-security` admission controller.
-
-Check the application logs:
-```sh
-kubectl logs -l app=lab-service -f
-```
-
-Verify service access via port-forwarding:
-```sh
-# Forward port 8080 from the cluster pod
-kubectl port-forward svc/lab-service 8080:8080
-
-# In a separate shell, test HTTP response
-curl http://localhost:8080
-```
-
-#### 5. Uninstalling from the Cluster
-
-When testing is complete, clean up the release:
-```sh
-mise run helm-u
-# or: helm uninstall test
-```
-
----
-
-## Local Development & Tasks
-
-### Setup
-
-```bash
-# Install tools and git hooks
 mise run install
 ```
 
-### Available Tasks
+### 2. Build Dependencies, Lint, and Render Chart
 
-Run tasks with `mise run <task>`:
+Fetch the locked upstream subchart, lint, and render manifests locally:
+
+```sh
+# Download upstream chart dependency into chart/charts/
+mise run helm-d
+
+# Lint wrapper chart
+mise run helm-l
+
+# Render manifests to rendered.yaml
+mise run helm-t
+```
+
+### 3. Install to Cluster
+
+Deploy the chart to your connected Kubernetes cluster:
+
+```sh
+mise run helm-i
+# or:
+# helm dependency build chart/
+# helm install pvc-rancher chart/
+```
+
+> **Note:** When `namespace.create` is `true` (default), the chart creates and labels the `local-path-storage` namespace directly—do not pass `--create-namespace` to `helm install`. If `local-path-storage` already exists in your cluster, set `namespace.create=false` and ensure the namespace carries `pod-security.kubernetes.io/enforce=privileged`.
+
+### 4. Verify StorageClass and Controller
+
+```sh
+# Verify namespace PSA labels
+kubectl get ns local-path-storage --show-labels
+
+# Verify controller pod is running
+kubectl get pods -n local-path-storage -l app.kubernetes.io/name=local-path-provisioner
+
+# Verify default StorageClass
+kubectl get storageclass local-path
+```
+
+---
+
+## Testing PVC Provisioning (Restricted Workload Namespace)
+
+To verify dynamic volume provisioning from a namespace enforcing `restricted` pod security:
+
+### 1. Apply a Test PVC and Restricted Pod
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-local-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-local-pod
+  namespace: default
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: writer
+      image: docker.io/library/busybox:latest
+      command: ["/bin/sh", "-c", "echo 'Hello from Talos!' > /data/message.txt && cat /data/message.txt && sleep 3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: test-local-pvc
+```
+
+```sh
+kubectl apply -f test-pvc.yaml
+```
+
+### 2. Verify Bound Status
+
+Because `volumeBindingMode` is `WaitForFirstConsumer`, the PV is dynamically provisioned on the node where `test-local-pod` is scheduled:
+
+```sh
+# Check PVC status
+kubectl get pvc test-local-pvc
+
+# Check pod logs
+kubectl logs test-local-pod
+
+# Verify provisioner logs
+kubectl logs -n local-path-storage -l app.kubernetes.io/name=local-path-provisioner
+```
+
+### 3. Cleanup Test Resources
+
+```sh
+kubectl delete pod test-local-pod
+kubectl delete pvc test-local-pvc
+```
+
+---
+
+## Configuration Reference
+
+Key parameters in [`chart/values.yaml`](chart/values.yaml) (any upstream [local-path-provisioner chart value](https://github.com/rancher/local-path-provisioner/blob/v0.0.37/deploy/chart/local-path-provisioner/values.yaml) can be passed under `local-path-provisioner:`):
+
+| Parameter | Description | Default |
+|---|---|---|
+| `namespace.create` | Create and label the target namespace | `true` |
+| `namespace.name` | Target namespace name | `local-path-storage` |
+| `namespace.podSecurity.enforce` | Pod Security Admission `enforce` level | `privileged` |
+| `local-path-provisioner.namespaceOverride` | Namespace for subchart resources (keep aligned with `namespace.name`) | `local-path-storage` |
+| `local-path-provisioner.nodePathMap` | Node path configuration for volume storage | `[{node: DEFAULT_PATH_FOR_NON_LISTED_NODES, paths: [/var/local/local-path-provisioner]}]` |
+| `local-path-provisioner.storageClass.create` | Create StorageClass | `true` |
+| `local-path-provisioner.storageClass.name` | StorageClass name | `local-path` |
+| `local-path-provisioner.storageClass.provisionerName` | Provisioner identifier | `rancher.io/local-path` |
+| `local-path-provisioner.storageClass.defaultClass` | Mark as cluster default StorageClass | `true` |
+| `local-path-provisioner.storageClass.volumeBindingMode` | Binding mode (`Immediate` or `WaitForFirstConsumer`) | `WaitForFirstConsumer` |
+| `local-path-provisioner.storageClass.reclaimPolicy` | Reclaim policy (`Delete` or `Retain`) | `Delete` |
+| `local-path-provisioner.podSecurityContext.runAsNonRoot` | Enforce non-root pod execution on controller | `true` |
+| `local-path-provisioner.podSecurityContext.runAsUser` | Controller UID | `65534` |
+| `local-path-provisioner.securityContext.readOnlyRootFilesystem` | Read-only root filesystem on controller | `true` |
+| `local-path-provisioner.securityContext.capabilities.drop` | Dropped capabilities on controller | `["ALL"]` |
+
+---
+
+## Available Mise Tasks
+
+Run tasks using `mise run <task>`:
 
 | Task | Description | Command |
 |---|---|---|
-| `install` | Install tools and set up git hooks | `hk install --mise` |
-| `hk` (or `check`) | Run all linters and hook checks | `hk check --all` |
-| `compose` | Start local container stack with Podman Compose | `podman compose up -d` |
-| `down` | Stop local Podman Compose stack | `podman compose down` |
-| `logs` | View Podman Compose logs | `podman compose logs -f` |
-| `play` | Test Helm chart manifests locally with Podman Play Kube | `podman play kube rendered.yaml --publish-all` |
-| `play-d` | Stop and remove Podman Play Kube pods | `podman play kube rendered.yaml --down` |
+| `install` | Install tools and configure git hooks | `hk install --mise` |
+| `hk` (or `check`) | Run all project linters and checks | `hk check --all` |
 | `helm-d` | Build Helm chart dependencies | `helm dependency build chart/` |
 | `helm-l` | Lint Helm chart | `helm lint chart/` |
-| `helm-t` | Render Helm chart templates to `rendered.yaml` | `helm template test chart/ > rendered.yaml` |
-| `helm-i` | Install Helm chart to current Kubernetes cluster | `helm install test chart/` |
-| `helm-u` | Uninstall Helm chart release from cluster | `helm uninstall test` |
-| `trivy-fs` | Scan repository filesystem for security vulnerabilities | `trivy fs .` |
+| `helm-t` | Render templates to `rendered.yaml` | `helm template test chart/ > rendered.yaml` |
+| `helm-i` | Install Helm chart to cluster | `helm install test chart/` |
+| `helm-u` | Uninstall Helm chart from cluster | `helm uninstall test` |
+| `trivy-fs` | Scan filesystem for vulnerabilities | `trivy fs .` |
 
 ---
 

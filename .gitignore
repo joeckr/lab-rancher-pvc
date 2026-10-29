@@ -26,4 +26,5 @@ Thumbs.db
 .discovered_charts.txt
 
 # Helm charts
+chart/charts/
 rendered.yaml

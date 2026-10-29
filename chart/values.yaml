@@ -1,43 +1,102 @@
-app:
-  name: lab-service
-  image: nginxinc/nginx-unprivileged
-  tag: alpine
-  pullPolicy: Always
+# Default values for pvc-rancher.
+# Wraps the official Rancher local-path-provisioner Helm chart with defaults
+# tailored for Talos Linux and clusters enforcing restricted Pod Security Standards.
+
+# Managed Namespace configuration.
+# Helper pods spawned by local-path-provisioner mount node directories via hostPath
+# and execute mkdir/rm as root, which Pod Security Admission forbids under baseline
+# and restricted profiles. Labeling this isolated system namespace as privileged
+# permits helper pods to run while keeping workload namespaces restricted.
+namespace:
+  create: true
+  # Keep aligned with local-path-provisioner.namespaceOverride when overriding release namespace.
+  name: local-path-storage
+  podSecurity:
+    enforce: privileged
+    enforceVersion: latest
+    audit: privileged
+    warn: privileged
+  labels: {}
+  annotations: {}
+
+commonLabels: {}
+nameOverride: ""
+
+# Values passed directly to the upstream local-path-provisioner subchart.
+# Upstream reference: https://github.com/rancher/local-path-provisioner/tree/v0.0.37/deploy/chart/local-path-provisioner
+local-path-provisioner:
   replicaCount: 1
-  port: 8080
-  env: "lab"
-  resources:
-    limits:
-      cpu: 250m
-      memory: 256Mi
+  namespaceOverride: local-path-storage
+
+  image:
+    repository: docker.io/rancher/local-path-provisioner
+    tag: v0.0.37
+    pullPolicy: IfNotPresent
+
+  helperImage:
+    repository: docker.io/library/busybox
+    tag: latest
+
+  # Talos Linux has an immutable root filesystem (/) and ephemeral /opt.
+  # Persistent local storage on Talos resides under /var (/var/local/local-path-provisioner by default).
+  nodePathMap:
+    - node: DEFAULT_PATH_FOR_NON_LISTED_NODES
+      paths:
+        - /var/local/local-path-provisioner
+
+  storageClass:
+    create: true
+    provisionerName: rancher.io/local-path
+    defaultClass: true
+    defaultVolumeType: hostPath
+    name: local-path
+    reclaimPolicy: Delete
+    volumeBindingMode: WaitForFirstConsumer
+
+  # Harden the long-running provisioner controller pod to satisfy the Kubernetes
+  # Pod Security Standards "restricted" profile, even inside the privileged namespace.
+  hostUsers: true
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    fsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+
   securityContext:
     allowPrivilegeEscalation: false
-    readOnlyRootFilesystem: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
     capabilities:
       drop:
         - ALL
-  podSecurityContext:
-    runAsNonRoot: true
     seccompProfile:
       type: RuntimeDefault
-    fsGroup: 1031
+
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 25m
+      memory: 32Mi
+
+  helperPod:
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 25m
+        memory: 32Mi
+
   tolerations:
-    - key: "node-role.kubernetes.io/control-plane"
-      operator: "Exists"
-      effect: "NoSchedule"
-    - key: "node-role.kubernetes.io/master"
-      operator: "Exists"
-      effect: "NoSchedule"
-
-service:
-  name: lab-service
-  type: ClusterIP
-  port: 8080
-
-ingress:
-  enabled: true
-  name: lab-ingress
-  host: "test.joeckr.dev" # add your own domain
-  className: "nginx"
-  path: /
-  pathType: "Prefix"
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
